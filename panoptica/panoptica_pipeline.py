@@ -164,20 +164,23 @@ def _panoptic_evaluate(
             instance_metadata["original_n_refs"] = processing_pair.n_ref_instances
 
         # Detect if many-to-one mappings were used (like in MaximizeMergeMatching)
-        # This happens when the effective number of prediction instances is less than original
-        has_many_to_one_mappings = (
+        # This happens when the effective number of prediction instances is less than original.
+        # One-to-many mappings raise it instead, so those are signalled explicitly by the
+        # matcher rather than inferred from the counts.
+        has_asymmetric_mappings = (
             processing_pair.n_pred_instances < instance_metadata["original_n_preds"]
+            or processing_pair.has_shared_predictions
         )
 
-        # Use effective counts if many-to-one mappings were detected, otherwise use original counts
+        # Use effective counts if asymmetric mappings were detected, otherwise use original counts
         final_n_pred_instances = (
             processing_pair.n_pred_instances
-            if has_many_to_one_mappings
+            if has_asymmetric_mappings
             else instance_metadata["original_n_preds"]
         )
         final_n_ref_instances = (
             processing_pair.n_ref_instances
-            if has_many_to_one_mappings
+            if has_asymmetric_mappings
             else instance_metadata["original_n_refs"]
         )
 
@@ -378,22 +381,22 @@ def _panoptic_evaluate_region_wise(
                             processing_pair_r.n_ref_instances
                         )
 
-                    # Detect if many-to-one mappings were used (like in MaximizeMergeMatching)
-                    # This happens when the effective number of prediction instances is less than original
-                    has_many_to_one_mappings = (
+                    # See the note in _panoptic_evaluate.
+                    has_asymmetric_mappings = (
                         processing_pair_r.n_pred_instances
                         < instance_metadata["original_n_preds"]
+                        or processing_pair_r.has_shared_predictions
                     )
 
-                    # Use effective counts if many-to-one mappings were detected, otherwise use original counts
+                    # Use effective counts if asymmetric mappings were detected, otherwise use original counts
                     final_n_pred_instances = (
                         processing_pair_r.n_pred_instances
-                        if has_many_to_one_mappings
+                        if has_asymmetric_mappings
                         else instance_metadata["original_n_preds"]
                     )
                     final_n_ref_instances = (
                         processing_pair_r.n_ref_instances
-                        if has_many_to_one_mappings
+                        if has_asymmetric_mappings
                         else instance_metadata["original_n_refs"]
                     )
 

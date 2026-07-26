@@ -183,7 +183,9 @@ def map_instance_labels(
     ref_labels = processing_pair.ref_labels
     pred_labels = processing_pair.pred_labels
 
-    label_counter = int(max(ref_labels) + 1)
+    label_counter = int(max(ref_labels, default=0) + 1)
+    # Predictions matched to several references are relabeled to their primary reference;
+    # the remaining references reach the evaluator through prediction_labels_per_ref.
     pred_labelmap = labelmap.get_one_to_one_dictionary()
 
     # assign missed instances to next unused labels sequentially
@@ -198,10 +200,37 @@ def map_instance_labels(
     # Using the labelmap, actually change the labels in the array here
     prediction_arr_relabeled = _map_labels(prediction_arr, pred_labelmap)
 
+    derived_fields: dict = {}
+    if labelmap.has_multi_ref_predictions():
+        # Relabeling can no longer express the match structure on its own: a reference that
+        # is not the primary reference of its prediction does not appear in the relabeled
+        # array at all, so the fields MatchedInstancePair would otherwise derive from the
+        # arrays are computed from the labelmap instead. Maps that are at most many-to-one
+        # skip this entirely and keep the original array-derived defaults.
+        ref_to_pred_labels = labelmap.get_ref_to_pred_dictionary()
+        matched_instances = sorted(ref_to_pred_labels)
+        derived_fields = {
+            # P_M(g) for every matched reference, in relabeled prediction labels.
+            "prediction_labels_per_ref": {
+                ref_label: sorted({pred_labelmap[p] for p in matched_pred_labels})
+                for ref_label, matched_pred_labels in ref_to_pred_labels.items()
+            },
+            "matched_instances": matched_instances,
+            "missed_reference_labels": [
+                r for r in ref_labels if r not in ref_to_pred_labels
+            ],
+            "missed_prediction_labels": [pred_labelmap[p] for p in missed_pred_labels],
+            # A prediction is a FP only if it is matched to no reference at all, so the
+            # effective count (used downstream as fp = n_pred_instances - tp) is every
+            # unmatched prediction plus one prediction group per matched reference.
+            "n_pred_instances": len(missed_pred_labels) + len(matched_instances),
+        }
+
     # Build a MatchedInstancePair out of the newly derived data
     matched_instance_pair = MatchedInstancePair(
         prediction_arr=prediction_arr_relabeled,
         reference_arr=processing_pair.reference_arr,
+        **derived_fields,
     )
     return matched_instance_pair
 
@@ -554,6 +583,174 @@ class MaximizeMergeMatching(ThresholdBasedMatching):
             pred_instance_idx=pred_labels,
         )
         return score
+
+    @classmethod
+    def _yaml_repr(cls, node) -> dict:
+        return {
+            "matching_metric": node._matching_metric,
+            "matching_threshold": node._matching_threshold,
+            "strict_threshold": node._strict_threshold,
+        }
+
+
+class OneToManyMatching(ThresholdBasedMatching):
+    """
+    Instance matching algorithm in which a single predicted instance may be matched to
+    several reference instances, while every reference instance is matched by at most one
+    prediction.
+
+    In the notation of the manuscript this constrains ``deg_M(g) <= 1`` for all ``g in G``
+    and leaves ``deg_M(p)`` unconstrained. Because reference instances do not compete for
+    predictions, the max-weight matching decomposes into independent per-reference
+    decisions and reduces to selecting, for every reference instance, its best-scoring
+    candidate above the threshold (or no candidate at all)::
+
+        M* = union over g in G of {(g, argmax_{p : score(g, p) > tau} score(g, p))}
+
+    Only overlapping candidate pairs are scored, so the cost is bounded by O(mn).
+
+    A prediction that is the best candidate for several references is entered into the
+    ``InstanceLabelMap`` once per reference. Its voxels are relabeled to the highest
+    scoring of those references, and every other reference reaches the instance evaluator
+    through ``MatchedInstancePair.prediction_labels_per_ref``, so its metrics are computed
+    against the whole undivided prediction, as required by the definition of SQ.
+
+    Attributes:
+        matching_metric (Metric): The metric used for matching.
+        matching_threshold (float): The threshold for matching instances.
+        strict_threshold (bool): If True, a candidate must strictly beat the threshold
+            (``>`` for increasing metrics, ``<`` for decreasing ones). The manuscript
+            defines the candidate edge set with a strict inequality, so this defaults to
+            True here, unlike in the other matchers.
+    """
+
+    def __init__(
+        self,
+        matching_metric: Metric = Metric.IOU,
+        matching_threshold: float = 0.5,
+        strict_threshold: bool = True,
+    ) -> None:
+        """
+        Initialize the OneToManyMatching instance.
+
+        Args:
+            matching_metric (Metric): The metric used for matching.
+            matching_threshold (float): The threshold for matching instances.
+            strict_threshold (bool): If True, a candidate must strictly beat the threshold
+                (``>`` instead of ``>=``). Defaults to True, matching the strict
+                inequality in the definition of the candidate edge set.
+        """
+        super().__init__(matching_metric, matching_threshold, strict_threshold)
+
+    def _is_better(self, score: float, than: float) -> bool:
+        """Direction-aware strict comparison of two scores of the matching metric.
+
+        Reuses ``score_beats_threshold`` so increasing metrics (IOU, DSC) and decreasing
+        ones (ASSD) are both handled without branching on the direction.
+        """
+        return self._matching_metric.score_beats_threshold(
+            score, than, strict_comparison=True
+        )
+
+    def compute_matching_edges(
+        self,
+        unmatched_instance_pair: UnmatchedInstancePair,
+        context: MatchingContext | None = None,
+        *,
+        matching_threshold: float | None = None,
+    ) -> dict[int, tuple[int, float]]:
+        """
+        Compute the optimal One-to-Many matching M*.
+
+        Args:
+            unmatched_instance_pair (UnmatchedInstancePair): The unmatched instance pair.
+            context (Optional[MatchingContext]): The matching context.
+            matching_threshold (Optional[float]): Threshold override; falls back to the
+                threshold configured on this instance.
+
+        Returns:
+            dict[int, tuple[int, float]]: Every matched reference label mapped to its
+                ``(prediction label, matching score)``. Reference labels absent from the
+                mapping are false negatives, prediction labels absent from its values are
+                false positives, and a prediction label may appear for several references.
+        """
+        if matching_threshold is None:
+            matching_threshold = self._matching_threshold
+
+        mm_pairs = self._calculate_matching_metric_pairs(
+            unmatched_instance_pair, context, self._matching_metric
+        )
+
+        # One independent argmax per reference label. Deliberately order-independent apart
+        # from ties, instead of relying on mm_pairs being sorted best-first.
+        best_per_ref: dict[int, tuple[int, float]] = {}
+        for matching_score, (ref_label, pred_label) in mm_pairs:
+            if not self._matching_metric.score_beats_threshold(
+                matching_score,
+                matching_threshold,
+                strict_comparison=self._strict_threshold,
+            ):
+                continue
+            incumbent = best_per_ref.get(int(ref_label))
+            if incumbent is None or self._is_better(matching_score, incumbent[1]):
+                best_per_ref[int(ref_label)] = (int(pred_label), matching_score)
+
+        return best_per_ref
+
+    def _match_instances(  # type: ignore[override]
+        self,
+        unmatched_instance_pair: UnmatchedInstancePair,
+        context: MatchingContext | None = None,
+        *,
+        matching_threshold: float,
+        **kwargs,
+    ) -> InstanceLabelMap:
+        """
+        Perform One-to-Many instance matching.
+
+        Args:
+            unmatched_instance_pair (UnmatchedInstancePair): The unmatched instance pair to
+                be matched.
+            context (Optional[MatchingContext]): The matching context.
+            matching_threshold (float): The threshold for matching instances.
+            **kwargs: Additional keyword arguments.
+
+        Returns:
+            InstanceLabelMap: The result of the instance matching.
+        """
+        labelmap = InstanceLabelMap()
+
+        if (
+            len(unmatched_instance_pair.ref_labels) == 0
+            or len(unmatched_instance_pair.pred_labels) == 0
+        ):
+            return labelmap
+
+        best_per_ref = self.compute_matching_edges(
+            unmatched_instance_pair, context, matching_threshold=matching_threshold
+        )
+
+        # Group by prediction so that a shared prediction is entered best reference first,
+        # which makes the best reference the primary one and therefore the label the
+        # prediction's voxels are relabeled to.
+        refs_per_pred: dict[int, list[tuple[int, float]]] = {}
+        for ref_label, (pred_label, matching_score) in best_per_ref.items():
+            refs_per_pred.setdefault(pred_label, []).append((ref_label, matching_score))
+
+        for pred_label in sorted(refs_per_pred):
+            # Sorting by label first keeps tie-breaking deterministic across runs.
+            candidate_refs = sorted(refs_per_pred[pred_label])
+            ranked_refs = sorted(
+                candidate_refs,
+                key=lambda entry: entry[1],
+                reverse=self._matching_metric.increasing,
+            )
+            for ref_label, _ in ranked_refs:
+                labelmap.add_labelmap_entry(
+                    pred_label, ref_label, allow_multiple_refs=True
+                )
+
+        return labelmap
 
     @classmethod
     def _yaml_repr(cls, node) -> dict:

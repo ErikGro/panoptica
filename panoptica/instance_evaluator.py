@@ -36,12 +36,24 @@ def _extended_voxelspacing(voxelspacing: tuple[float, ...], ndim: int):
     return voxelspacing
 
 
+def _instance_mask(arr: np.ndarray, labels: list[int]) -> np.ndarray:
+    """Boolean mask of every voxel in ``arr`` carrying one of ``labels``.
+
+    Keeps the single-label fast path, which is the only case that occurs unless a
+    One-to-Many matcher shared one prediction between several references.
+    """
+    if len(labels) == 1:
+        return arr == labels[0]
+    return np.isin(arr, labels)
+
+
 def _union_instance_slice(
     ref_slices: list,
     pred_slices: list,
     label: int,
     shape: tuple[int, ...],
     px_pad: int = 2,
+    pred_labels: list[int] | None = None,
 ) -> tuple[slice, ...] | None:
     """Padded union of a label's reference and prediction bounding boxes.
 
@@ -50,10 +62,23 @@ def _union_instance_slice(
     that bounds the instance in both arrays plus ``px_pad`` voxels (so the downstream
     ``_get_paired_crop`` reproduces exactly the crop it would compute on the full array),
     or ``None`` when the label is absent from both.
+
+    ``pred_labels`` are the prediction labels forming P_M(g); every one of them
+    contributes to the union so that a prediction shared between references is not
+    cropped away. Defaults to ``[label]``.
     """
+    if pred_labels is None:
+        pred_labels = [label]
     boxes = []
-    for slices in (ref_slices, pred_slices):
-        box = slices[label - 1] if 0 < label <= len(slices) else None
+    box = ref_slices[label - 1] if 0 < label <= len(ref_slices) else None
+    if box is not None:
+        boxes.append(box)
+    for pred_label in pred_labels:
+        box = (
+            pred_slices[pred_label - 1]
+            if 0 < pred_label <= len(pred_slices)
+            else None
+        )
         if box is not None:
             boxes.append(box)
     if not boxes:
@@ -129,14 +154,30 @@ def evaluate_matched_instance(
         ref_slices = find_objects(reference_arr)
         pred_slices = find_objects(prediction_arr)
 
-        def _instance_slice_for(ref_idx: int) -> tuple[slice, ...] | None:
+        def _instance_slice_for(
+            ref_idx: int, pred_labels: list[int]
+        ) -> tuple[slice, ...] | None:
             return _union_instance_slice(
-                ref_slices, pred_slices, ref_idx, reference_arr.shape
+                ref_slices,
+                pred_slices,
+                ref_idx,
+                reference_arr.shape,
+                pred_labels=pred_labels,
             )
     else:
 
-        def _instance_slice_for(ref_idx: int) -> tuple[slice, ...] | None:
+        def _instance_slice_for(
+            ref_idx: int, pred_labels: list[int]
+        ) -> tuple[slice, ...] | None:
             return None
+
+    # P_M(g) per matched reference. Equals [ref_idx] unless a One-to-Many matcher shared a
+    # prediction between references, in which case the non-primary references point at the
+    # label that prediction was relabeled to.
+    pred_labels_per_ref = {
+        ref_idx: matched_instance_pair.prediction_labels_for(ref_idx)
+        for ref_idx in ref_matched_labels
+    }
 
     instance_args = [
         (
@@ -147,7 +188,8 @@ def evaluate_matched_instance(
             voxelspacing,
             processing_pair_orig_shape,
             n_ref_labels,
-            _instance_slice_for(ref_idx),
+            _instance_slice_for(ref_idx, pred_labels_per_ref[ref_idx]),
+            pred_labels_per_ref[ref_idx],
         )
         for ref_idx in ref_matched_labels
     ]
@@ -218,6 +260,7 @@ def evaluate_matched_instance(
         instance_volume_matched_ref=instance_volume_matched_ref,
         instance_voxel_count_unmatched_ref=instance_voxel_count_unmatched_ref,
         instance_volume_unmatched_ref=instance_volume_unmatched_ref,
+        has_shared_predictions=matched_instance_pair.has_shared_predictions,
     )
 
 
@@ -230,6 +273,7 @@ def _evaluate_instance(
     processing_pair_orig_shape: tuple[int, ...] | None = None,
     n_ref_labels: int | None = None,
     instance_slice: tuple[slice, ...] | None = None,
+    pred_labels: list[int] | None = None,
 ) -> _InstanceEvaluation:
     """
     Evaluate a single instance.
@@ -247,12 +291,14 @@ def _evaluate_instance(
     """
     # Restrict the per-instance mask extraction to the instance's bounding box when one
     # was precomputed; the one-hot spatial path below still reshapes the full arrays.
+    if pred_labels is None:
+        pred_labels = [ref_idx]
     if instance_slice is not None:
         ref_arr = reference_arr[instance_slice] == ref_idx
-        pred_arr = prediction_arr[instance_slice] == ref_idx
+        pred_arr = _instance_mask(prediction_arr[instance_slice], pred_labels)
     else:
         ref_arr = reference_arr == ref_idx
-        pred_arr = prediction_arr == ref_idx
+        pred_arr = _instance_mask(prediction_arr, pred_labels)
 
     # Detect if we have flattened one-hot arrays that need reshaping for spatial metrics
     is_flattened_onehot = (
@@ -306,7 +352,7 @@ def _evaluate_instance(
             prediction_arr, n_ref_labels, processing_pair_orig_shape
         )
         ref_spatial_instance = ref_spatial == ref_idx
-        pred_spatial_instance = pred_spatial == ref_idx
+        pred_spatial_instance = _instance_mask(pred_spatial, pred_labels)
         spatial_crop = _get_paired_crop(pred_spatial_instance, ref_spatial_instance)
         spatial_ref = ref_spatial_instance[spatial_crop]
         spatial_pred = pred_spatial_instance[spatial_crop]
