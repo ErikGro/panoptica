@@ -22,8 +22,6 @@ run(["python", "preprocess_readme.py"])
 # -- Project information -----------------------------------------------------
 
 project = "panoptica"
-copyright = "2023, florian kofler et al."
-author = "Florian Kofler et al."
 
 
 # -- General configuration ---------------------------------------------------
