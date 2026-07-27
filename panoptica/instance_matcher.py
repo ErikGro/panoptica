@@ -184,8 +184,6 @@ def map_instance_labels(
     pred_labels = processing_pair.pred_labels
 
     label_counter = int(max(ref_labels, default=0) + 1)
-    # Predictions matched to several references are relabeled to their primary reference;
-    # the remaining references reach the evaluator through prediction_labels_per_ref.
     pred_labelmap = labelmap.get_one_to_one_dictionary()
 
     # assign missed instances to next unused labels sequentially
@@ -202,11 +200,6 @@ def map_instance_labels(
 
     derived_fields: dict = {}
     if labelmap.has_multi_ref_predictions():
-        # Relabeling can no longer express the match structure on its own: a reference that
-        # is not the primary reference of its prediction does not appear in the relabeled
-        # array at all, so the fields MatchedInstancePair would otherwise derive from the
-        # arrays are computed from the labelmap instead. Maps that are at most many-to-one
-        # skip this entirely and keep the original array-derived defaults.
         ref_to_pred_labels = labelmap.get_ref_to_pred_dictionary()
         matched_instances = sorted(ref_to_pred_labels)
         derived_fields = {
