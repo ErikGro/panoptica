@@ -1,6 +1,6 @@
 from rich.console import Console
 
-CITATION_LINK = "https://github.com/BrainLesion/panoptica#citation"
+CITATION_LINK = ""
 
 # Runtime toggle for the citation reminder (replaces the old env var approach).
 _citation_reminder_enabled = True

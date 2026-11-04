@@ -320,11 +320,14 @@ class MatchedInstancePair(_ProcessingPairInstanced):
         missed_reference_labels (list[int]): Reference labels with no matching prediction.
         missed_prediction_labels (list[int]): Prediction labels with no matching reference.
         matched_instances (list[int]): Labels matched between prediction and reference arrays.
+        prediction_labels_per_ref (dict[int, list[int]] | None): For each matched reference
+            label, the prediction labels forming P_M(g) in this pair's prediction array.
     """
 
     missed_reference_labels: list[int]
     missed_prediction_labels: list[int]
     matched_instances: list[int]
+    prediction_labels_per_ref: dict[int, list[int]] | None
 
     def __init__(
         self,
@@ -335,6 +338,7 @@ class MatchedInstancePair(_ProcessingPairInstanced):
         matched_instances: list[int] | None = None,
         n_pred_instances: int | None = None,
         n_ref_instances: int | None = None,
+        prediction_labels_per_ref: dict[int, list[int]] | None = None,
     ) -> None:
         """Initializes a MatchedInstancePair
 
@@ -371,6 +375,41 @@ class MatchedInstancePair(_ProcessingPairInstanced):
             )
         self.missed_prediction_labels = missed_prediction_labels
 
+        self.prediction_labels_per_ref = prediction_labels_per_ref
+
+    def prediction_labels_for(self, ref_label: int) -> list[int]:
+        """Prediction labels forming P_M(g) for a matched reference label.
+
+        Relabeling gives a matched prediction the label of its reference, so the answer is
+        ``[ref_label]`` unless the matcher produced a One-to-Many map, in which case a
+        reference that is not the primary reference of its prediction points at that
+        prediction's primary label instead.
+
+        Args:
+            ref_label (int): The matched reference label.
+
+        Returns:
+            list[int]: Labels to select in ``prediction_arr`` to obtain P_M(g).
+        """
+        if self.prediction_labels_per_ref is None:
+            return [ref_label]
+        return self.prediction_labels_per_ref.get(ref_label, [ref_label])
+
+    @property
+    def has_shared_predictions(self) -> bool:
+        """True if some reference is matched by a prediction it does not own the label of.
+
+        Only a One-to-Many matcher produces this, and it is the signal that
+        ``n_pred_instances`` is an effective count that downstream code must not replace
+        with the pre-matching prediction count.
+        """
+        if self.prediction_labels_per_ref is None:
+            return False
+        return any(
+            pred_labels != [ref_label]
+            for ref_label, pred_labels in self.prediction_labels_per_ref.items()
+        )
+
     @property
     def n_matched_instances(self):
         return len(self.matched_instances)
@@ -387,6 +426,14 @@ class MatchedInstancePair(_ProcessingPairInstanced):
             missed_reference_labels=self.missed_reference_labels,
             missed_prediction_labels=self.missed_prediction_labels,
             matched_instances=self.matched_instances,
+            prediction_labels_per_ref=(
+                None
+                if self.prediction_labels_per_ref is None
+                else {
+                    ref: list(preds)
+                    for ref, preds in self.prediction_labels_per_ref.items()
+                }
+            ),
         )
 
 
@@ -409,6 +456,9 @@ class EvaluateInstancePair:
         instance_volume_matched_ref (list[float]): Physical volume of each matched (TP) reference instance, computed as voxel count times ``prod(voxelspacing)``.
         instance_voxel_count_unmatched_ref (list[int]): Raw voxel count of each unmatched (FN) reference instance.
         instance_volume_unmatched_ref (list[float]): Physical volume of each unmatched (FN) reference instance.
+        has_shared_predictions (bool): True if a One-to-Many matcher credited one prediction
+            to several references, in which case ``n_pred_instances`` is the effective count
+            and must not be replaced by the pre-matching count.
     """
 
     reference_arr: np.ndarray
@@ -421,6 +471,7 @@ class EvaluateInstancePair:
     instance_volume_matched_ref: list[float] = field(default_factory=list)
     instance_voxel_count_unmatched_ref: list[int] = field(default_factory=list)
     instance_volume_unmatched_ref: list[float] = field(default_factory=list)
+    has_shared_predictions: bool = False
 
 
 class InputType(_Enum_Compare):
