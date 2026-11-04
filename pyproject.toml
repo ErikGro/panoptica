@@ -13,10 +13,6 @@ version = "0.0.0"
 name = "panoptica"
 dynamic = ["version"]
 description = "Panoptic Quality (PQ) computation for binary masks."
-authors = [
-    { name = "Hendrik Möller", email = "hendrik.moeller@tum.de" },
-    { name = "Florian Kofler", email = "florian.kofler@tum.de" },
-]
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
 license = { file = "LICENSE" }
