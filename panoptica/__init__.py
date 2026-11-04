@@ -6,6 +6,7 @@ from panoptica.instance_matcher import (
     NaiveThresholdMatching,
     MaxBipartiteMatching,
     OneToManyMatching,
+    MaximizeMergeMatching
 )
 from panoptica.panoptica_statistics import (
     Panoptica_Statistic,
